@@ -13,185 +13,160 @@ export default function RealtimeAssistant() {
   const [state, setState] = useState<AppState>('idle');
   const [isConnected, setIsConnected] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
-  const ws = useRef<WebSocket | null>(null);
   
-  // Audio state
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const playTimeRef = useRef<number>(0);
+  // Referencias para WebRTC
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
 
   const addLog = (msg: string) => {
     setLogs(prev => [...prev.slice(-4), msg]);
   };
 
-  const connect = async () => {
+  const initWebRTC = async () => {
     try {
-      const wsUrl = process.env.NEXT_PUBLIC_WS_BACKEND_URL || 'ws://127.0.0.1:8000/ws/realtime';
-      ws.current = new WebSocket(wsUrl);
+      addLog("Solicitando Token Seguro al Backend (REST)...");
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
       
-      ws.current.onopen = async () => {
-        setIsConnected(true);
-        setState('listening');
-        addLog("Conectado. Inicializando micrófono...");
-        await initMicrophone();
+      // 1. Obtener Ephemeral Token de FastAPI
+      const sessionRes = await fetch(`${backendUrl}/api/session`);
+      if (!sessionRes.ok) {
+        throw new Error("HTTP Backend falló al pedir Session a OpenAI. Asegura que FastAPI corra.");
+      }
+      const sessionData = await sessionRes.json();
+      const ephemeralKey = sessionData.client_secret.value;
+
+      // 2. Iniciar WebRTC Peer Connection
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+
+      // Elemento de audio invisible para reproducir la voz de OpenAI
+      const audioEl = document.createElement("audio");
+      audioEl.autoplay = true;
+      audioElRef.current = audioEl;
+
+      pc.ontrack = e => {
+        addLog("Conexión de Audio Recibida (Zero Latency)...");
+        audioEl.srcObject = e.streams[0];
       };
+
+      // 3. Obtener micrófono local y agregarlo a WebRTC
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = ms;
+      pc.addTrack(ms.getTracks()[0]);
+
+      // 4. Configurar el Data Channel para enviar y recibir texto/eventos
+      const dc = pc.createDataChannel("oai-events");
+      dcRef.current = dc;
       
-      ws.current.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        handleServerEvent(data);
+      dc.onopen = () => {
+          setIsConnected(true);
+          setState("listening");
+          addLog("Banco Mercantil WebRTC Activo. ¡Habla ahora!");
       };
+
+      dc.onmessage = async (e) => {
+        const msg = JSON.parse(e.data);
+        handleOpenAIEvent(msg, dc, backendUrl);
+      };
+
+      // 5. Crear la oferta SDP local
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const baseUrl = "https://api.openai.com/v1/realtime";
+      const model = "gpt-realtime-mini-2025-12-15";
       
-      ws.current.onclose = () => {
-        setIsConnected(false);
-        setState('idle');
-        addLog("Conexión cerrada.");
-        stopMicrophone();
+      // 6. Hacer el handshake WebRTC de autorización sobre HTTP SSL
+      const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+        method: "POST",
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${ephemeralKey}`,
+          "Content-Type": "application/sdp"
+        }
+      });
+
+      if (!sdpResponse.ok) {
+          throw new Error("Handshake SDP falló debido a llave o modelo.");
+      }
+      
+      // 7. Settear la respuesta SDP Remota (el server contesta)
+      const answer = {
+          type: "answer" as RTCSdpType,
+          sdp: await sdpResponse.text(),
       };
-    } catch (err) {
-      addLog("Error en conexión.");
+      await pc.setRemoteDescription(answer);
+
+    } catch (err: any) {
+      addLog(`Error WebRTC: ${err.message}`);
+      disconnect();
+    }
+  };
+
+  const handleOpenAIEvent = async (msg: any, dc: RTCDataChannel, backendUrl: string) => {
+    try {
+      if (msg.type === "response.created") setState("processing");
+      
+      // Cuando empezamos a recibir el streaming de inteligencia
+      if (msg.type === "response.audio.delta" && state !== "speaking") {
+          setState("speaking");
+      }
+      
+      // Transcripción local 
+      if (msg.type === "response.audio_transcript.done") {
+          addLog("Banco: " + msg.transcript);
+          setState("listening");
+      }
+      
+      // Manejo de la función delegada al Backend (Seguridad)
+      if (msg.type === "response.function_call_arguments.done") {
+        setState("processing");
+        addLog(`Verificando Tool Backend HTTPS: ${msg.name}`);
+        
+        let argsObj = {};
+        try { argsObj = JSON.parse(msg.arguments); } catch(e){}
+
+        // Enviar vía REST POST simple al Backend
+        const toolReq = await fetch(`${backendUrl}/api/tools`, {
+            method: "POST",
+            body: JSON.stringify({ name: msg.name, arguments: argsObj }),
+            headers: { "Content-Type": "application/json" }
+        });
+        const result = await toolReq.json();
+        
+        // Devolver resultado de forma P2P a OpenAI en el momento exacto
+        dc.send(JSON.stringify({
+            type: "conversation.item.create",
+            item: {
+                type: "function_call_output",
+                call_id: msg.call_id,
+                output: JSON.stringify(result)
+            }
+        }));
+        dc.send(JSON.stringify({ type: "response.create" }));
+      }
+    } catch(err) {
+      console.error(err);
     }
   };
 
   const disconnect = () => {
-    if (ws.current) {
-      ws.current.close();
-    }
-  };
-
-  const initMicrophone = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          sampleRate: 24000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true
-        } 
-      });
-      streamRef.current = stream;
-
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      audioCtxRef.current = audioCtx;
-      
-      const source = audioCtx.createMediaStreamSource(stream);
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-      
-      source.connect(processor);
-      processor.connect(audioCtx.destination);
-      
-      processor.onaudioprocess = (e) => {
-        if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-        
-        const inputData = e.inputBuffer.getChannelData(0);
-        const pcm16 = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        
-        const buffer = new Uint8Array(pcm16.buffer);
-        let binary = '';
-        for (let i = 0; i < buffer.byteLength; i++) {
-          binary += String.fromCharCode(buffer[i]);
-        }
-        const base64 = btoa(binary);
-        
-        ws.current.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: base64
-        }));
-      };
-      
-    } catch (err) {
-      addLog("Micrófono denegado o error.");
-      disconnect();
-    }
-  };
-
-  const stopMicrophone = () => {
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
-    }
-  };
-
-  const handleServerEvent = (data: any) => {
-    switch (data.type) {
-      case 'response.created':
-        setState('processing');
-        break;
-      case 'response.audio.delta':
-        setState('speaking');
-        playAudioDelta(data.delta);
-        break;
-      case 'response.done':
-        setState('listening');
-        break;
-      case 'response.function_call_arguments.done':
-        addLog(`Simulando operación: ${data.name}...`);
-        setState('processing');
-        break;
-      case 'conversation.item.create':
-        if(data.item?.role === "assistant" && data.item?.content) {
-            const txt = data.item.content.find((c: any) => c.type === "text");
-            if(txt) addLog("Banco: " + txt.text);
-        }
-        break;
-    }
-  };
-
-  const playAudioDelta = (base64Audio: string) => {
-    if (!audioCtxRef.current) return;
+    setIsConnected(false);
+    setState("idle");
+    localStreamRef.current?.getTracks().forEach(t => t.stop());
+    dcRef.current?.close();
+    pcRef.current?.close();
     
-    const binaryStr = atob(base64Audio);
-    const len = binaryStr.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-    }
-    
-    const pcm16 = new Int16Array(bytes.buffer);
-    const float32 = new Float32Array(pcm16.length);
-    for (let i = 0; i < pcm16.length; i++) {
-      float32[i] = pcm16[i] / 32768.0;
-    }
-    
-    const audioCtx = audioCtxRef.current;
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
-
-    const buffer = audioCtx.createBuffer(1, float32.length, 24000);
-    buffer.getChannelData(0).set(float32);
-    
-    const source = audioCtx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtx.destination);
-    
-    const now = audioCtx.currentTime;
-    if (playTimeRef.current < now) {
-        playTimeRef.current = now;
-    }
-    
-    source.start(playTimeRef.current);
-    playTimeRef.current += buffer.duration;
+    localStreamRef.current = null;
+    dcRef.current = null;
+    pcRef.current = null;
+    addLog("Desconectado de WebRTC.");
   };
 
   useEffect(() => {
-    return () => {
-      stopMicrophone();
-      disconnect();
-    };
+    return () => disconnect();
   }, []);
 
   return (
@@ -200,7 +175,7 @@ export default function RealtimeAssistant() {
         <h1 className={styles.title}>
           Banco Mercantil Santa Cruz
         </h1>
-        <p className={styles.subtitle}>Asistente Virtual por Voz (Demo)</p>
+        <p className={styles.subtitle}>Asistente WebRTC Zero-Latency (HTTPS)</p>
       </div>
 
       <div className={styles.orbContainer}>
@@ -218,13 +193,13 @@ export default function RealtimeAssistant() {
 
       <div className={styles.controls}>
         <button
-          onClick={isConnected ? disconnect : connect}
+          onClick={isConnected ? disconnect : initWebRTC}
           className={`${styles.button} ${isConnected ? styles.buttonConnected : styles.buttonDisconnected}`}
         >
           {isConnected ? (
-            <><MicOff style={{marginRight: '8px'}} /> Detener Conexión</>
+            <><MicOff style={{marginRight: '8px'}} /> Detener Streaming P2P</>
           ) : (
-            <><Mic style={{marginRight: '8px'}} /> Iniciar Asistente de Voz</>
+            <><Mic style={{marginRight: '8px'}} /> Iniciar P2P Asistente Seguro</>
           )}
         </button>
         
@@ -232,11 +207,11 @@ export default function RealtimeAssistant() {
           {logs.map((log, i) => (
             <div key={i} className={styles.logEntry}>{'>_ '} {log}</div>
           ))}
-          {logs.length === 0 && <span className={styles.logEmpty}>Esperando conexión...</span>}
+          {logs.length === 0 && <span className={styles.logEmpty}>Esperando conexión HTTPS...</span>}
         </div>
 
         <div className={styles.permissionInfo}>
-          <AlertCircle style={{width: '16px', height: '16px', marginRight: '4px'}} /> Requiere permisos de micrófono.
+          <AlertCircle style={{width: '16px', height: '16px', marginRight: '4px'}} /> Autenticación Serverless sobre Vercel aplicable.
         </div>
       </div>
     </div>
